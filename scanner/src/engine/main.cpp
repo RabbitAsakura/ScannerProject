@@ -12,10 +12,64 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sqlite3.h>
+#include <netinet/ip_icmp.h>
 
 std::mutex queue_mutex;
 std::mutex print_mutex;
 std::queue<int> port_queue;
+
+unsigned short calculate_checksum(void* b, int len) {
+    unsigned short* buf = (unsigned short*)b;
+    unsigned int sum = 0;
+    unsigned short result;
+
+    for (sum = 0; len > 1; len -= 2) sum += *buf++;
+    if (len == 1) sum += *(unsigned char*)buf;
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    result = ~sum;
+    return result;
+}
+
+bool is_host_alive(const char* target_ip) {
+    int sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sockfd < 0) {
+        std::cerr << "[-] Error: Raw socket creation failed. Did you run with sudo?" << std::endl;
+        return false;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    inet_pton(AF_INET, target_ip, &addr.sin_addr);
+
+    struct icmphdr icmp_hdr;
+    bzero(&icmp_hdr, sizeof(icmp_hdr));
+    icmp_hdr.type = ICMP_ECHO;
+    icmp_hdr.un.echo.id = getpid();
+    icmp_hdr.checksum = calculate_checksum(&icmp_hdr, sizeof(icmp_hdr));
+
+    if (sendto(sockfd, &icmp_hdr, sizeof(icmp_hdr), 0, (struct sockaddr*)&addr, sizeof(addr)) <= 0) {
+        close(sockfd);
+        return false;
+    }
+
+    char buffer[1024];
+    struct sockaddr_in r_addr;
+    socklen_t addr_len = sizeof(r_addr);
+    if (recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr*)&r_addr, &addr_len) > 0) {
+        close(sockfd);
+        return true;
+    }
+
+    close(sockfd);
+    return false;
+}
+
 
 void check_vulnerabilities(const std::string& banner) {
     sqlite3* db;
@@ -122,14 +176,22 @@ int main(int argc, char* argv[]) {
     }
 
     const char* target_ip = argv[1];
+
+    std::cout << "Initiating ping sweep on " << target_ip << "..." << std::endl;
+    
+    if (!is_host_alive(target_ip)) {
+        std::cout << "[-] Host appears to be down or is blocking ICMP. Skipping port scan." << std::endl;
+        return 0;
+    }
+    
+    std::cout << "[+] Host is up. Starting threaded port scan...\n" << std::endl;
+
     int num_threads = 100; 
 
     std::vector<int> common_ports = {21, 22, 23, 25, 53, 80, 110, 443, 8000, 8080};
     for (int p : common_ports) {
         port_queue.push(p);
     }
-
-    std::cout << "Scanning target: " << target_ip << " with " << num_threads << " threads...\n" << std::endl;
 
     std::vector<std::thread> threads;
     for (int i = 0; i < num_threads; ++i) {
